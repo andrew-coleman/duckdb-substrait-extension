@@ -16,6 +16,25 @@
 
 namespace duckdb {
 
+//! How a Substrait `extract` component maps onto a DuckDB `date_part` call.
+struct SubstraitExtractComponent {
+	//! Sentinel for `duckdb_base`: the `indexing` option does not apply to this component.
+	static constexpr int8_t NOT_INDEXED = -1;
+
+	//! The DuckDB date_part specifier to call.
+	const char *specifier;
+	//! Substrait's sub-second components are relative to the next larger unit ("microseconds
+	//! since the last full millisecond"), while DuckDB's are relative to the minute. Non-zero
+	//! means the result needs `% modulus` to match Substrait. 0 means no fix-up.
+	int64_t modulus = 0;
+	//! For the components governed by the `indexing` option, the first value DuckDB counts
+	//! from: date_part('dow') is 0-based, 'isodow'/'month'/'week' are 1-based.
+	int8_t duckdb_base = NOT_INDEXED;
+	//! UNIX_TIME is elapsed *whole* seconds. date_part('epoch') returns a DOUBLE and DuckDB's
+	//! DOUBLE->BIGINT cast rounds half-to-even, so it needs an explicit floor plus a cast.
+	bool epoch_seconds = false;
+};
+
 struct RootNameIterator {
 	explicit RootNameIterator(const google::protobuf::RepeatedPtrField<std::string> *names) : names(names) {};
 	string GetCurrentName() const {
@@ -101,7 +120,10 @@ private:
 	unique_ptr<ParsedExpression> TransformNested(const substrait::Expression &sexpr,
 	                                             RootNameIterator *iterator = nullptr);
 
-	static void VerifyCorrectExtractSubfield(const string &subfield);
+	//! Builds the DuckDB equivalent of a Substrait `extract` call. Throws for components
+	//! DuckDB cannot express, rather than emitting SQL that silently means something else.
+	static unique_ptr<ParsedExpression> TransformExtractExpr(const vector<string> &enum_expressions,
+	                                                        vector<unique_ptr<ParsedExpression>> children);
 	static string RemapFunctionName(const string &function_name);
 	static string RemoveExtension(const string &function_name);
 	static LogicalType SubstraitToDuckType(const substrait::Type &s_type);
@@ -129,7 +151,9 @@ private:
 	//! Remapped functions with differing names to the correct DuckDB functions
 	//! names
 	static const unordered_map<std::string, std::string> function_names_remap;
-	static const case_insensitive_set_t valid_extract_subfields;
+	//! Substrait `extract` component -> DuckDB date_part specifier plus any fix-up needed
+	//! to match Substrait's semantics. Absent components are rejected explicitly.
+	static const case_insensitive_map_t<SubstraitExtractComponent> extract_components;
 	vector<ParsedExpression *> struct_expressions;
 	//! If we should acquire a client context lock when creating the relatiosn
 	const bool acquire_lock;

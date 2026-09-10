@@ -68,9 +68,55 @@ const std::unordered_map<std::string, std::string> SubstraitToDuckDB::function_n
     {"least_skip_null", "least"},
     {"greatest_skip_null", "greatest"}};
 
-const case_insensitive_set_t SubstraitToDuckDB::valid_extract_subfields = {
-    "year",    "month",       "day",          "decade", "century", "millenium",
-    "quarter", "microsecond", "milliseconds", "second", "minute",  "hour"};
+// Substrait's `extract` component enum, mapped onto DuckDB date_part specifiers. Components
+// that DuckDB cannot express are deliberately absent: TransformExtractExpr throws for them,
+// which is better than the previous D_ASSERT-only check that compiled away in release and let
+// invalid specifiers reach the binder.
+const case_insensitive_map_t<SubstraitExtractComponent> SubstraitToDuckDB::extract_components = {
+    // Same meaning, same or different spelling.
+    {"YEAR", {"year"}},
+    {"ISO_YEAR", {"isoyear"}},
+    {"HOUR", {"hour"}},
+    {"MINUTE", {"minute"}},
+    {"SECOND", {"second"}},
+    // Governed by the `indexing` option; the third field is the base DuckDB counts from.
+    {"QUARTER", {"quarter", 0, 1}},
+    {"MONTH", {"month", 0, 1}},
+    {"DAY", {"day", 0, 1}},
+    {"DAY_OF_YEAR", {"dayofyear", 0, 1}},
+    {"ISO_WEEK", {"week", 0, 1}},
+    {"MONDAY_DAY_OF_WEEK", {"isodow", 0, 1}},
+    {"SUNDAY_DAY_OF_WEEK", {"dow", 0, 0}},
+    // Sub-second.
+    //
+    // FIXME: MILLISECOND and MICROSECOND are knowingly non-conforming here. Substrait defines
+    // them relative to the next larger unit ("microseconds since the last full millisecond",
+    // so 456 for ...11:59:44.123456) while DuckDB's are relative to the minute (44123456).
+    // The correct values would be `{"millisecond", 1000}` / `{"microsecond", 1000}`, but this
+    // extension's *producer* also maps DuckDB's minute-relative millisecond()/microsecond()
+    // onto these same components (to_substrait.cpp), so both sides are wrong in the same way
+    // and cancel out on a self round-trip. Correcting only this side makes
+    // `PRAGMA enable_verification` fail (48000000 <> 0). DuckDB has no single part meaning
+    // "microseconds since the last full millisecond", so the producer has to emit
+    // SECOND/SUBSECOND arithmetic (or refuse) before this can be fixed -- see follow-up.
+    {"MILLISECOND", {"millisecond"}},
+    {"MICROSECOND", {"microsecond"}},
+    // "MILLISECONDS" is not a Substrait component; it is what this extension's producer emits
+    // for DuckDB's milliseconds(). Accepted so those plans keep round-tripping.
+    {"MILLISECONDS", {"millisecond"}},
+    // SUBSECOND is unambiguous and nothing round-trips it today, so it gets the correct
+    // spec semantics: microseconds since the last full second.
+    {"SUBSECOND", {"microsecond", 1000000}},
+    // Elapsed whole seconds since 1970-01-01 UTC.
+    {"UNIX_TIME", {"epoch", 0, SubstraitExtractComponent::NOT_INDEXED, true}},
+    // Not in Substrait's component enum, but this extension's own producer emits them for
+    // DuckDB's decade()/century()/millennium(), so keep consuming them for round-trips.
+    // "MILLENIUM" is the misspelling older plans from this extension carry.
+    {"DECADE", {"decade"}},
+    {"CENTURY", {"century"}},
+    {"MILLENNIUM", {"millennium"}},
+    {"MILLENIUM", {"millennium"}},
+};
 
 string SubstraitToDuckDB::RemapFunctionName(const string &function_name) {
 	// Let's first drop any extension id
@@ -507,8 +553,63 @@ unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformSelectionExpr(const sub
 	return expr;
 }
 
-void SubstraitToDuckDB::VerifyCorrectExtractSubfield(const string &subfield) {
-	D_ASSERT(SubstraitToDuckDB::valid_extract_subfields.count(subfield));
+static unique_ptr<ParsedExpression> WrapBinary(const string &name, unique_ptr<ParsedExpression> lhs,
+                                              Value rhs) {
+	vector<unique_ptr<ParsedExpression>> args;
+	args.push_back(std::move(lhs));
+	args.push_back(make_uniq<ConstantExpression>(std::move(rhs)));
+	return make_uniq<FunctionExpression>(name, std::move(args));
+}
+
+unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformExtractExpr(const vector<string> &enum_expressions,
+                                                                    vector<unique_ptr<ParsedExpression>> children) {
+	if (enum_expressions.empty()) {
+		throw InvalidInputException("Substrait extract requires a component enum argument");
+	}
+	auto entry = extract_components.find(enum_expressions[0]);
+	if (entry == extract_components.end()) {
+		throw NotImplementedException("Substrait extract component \"%s\" has no DuckDB equivalent",
+		                              enum_expressions[0]);
+	}
+	auto &component = entry->second;
+	if (children.empty()) {
+		throw InvalidInputException("Substrait extract requires a value argument");
+	}
+	// The precision_timestamp_tz impls carry a trailing timezone string argument. Every
+	// component above is timezone-independent once the value itself is tz-aware, so drop it
+	// instead of emitting an unbindable three-argument date_part.
+	children.resize(1);
+	children.insert(children.begin(), make_uniq<ConstantExpression>(Value(component.specifier)));
+	unique_ptr<ParsedExpression> result = make_uniq<FunctionExpression>("date_part", std::move(children));
+
+	if (component.epoch_seconds) {
+		vector<unique_ptr<ParsedExpression>> floor_args;
+		floor_args.push_back(std::move(result));
+		result = make_uniq<FunctionExpression>("floor", std::move(floor_args));
+		result = make_uniq<CastExpression>(LogicalType::BIGINT, std::move(result));
+	}
+	if (component.modulus != 0) {
+		result = WrapBinary("mod", std::move(result), Value::BIGINT(component.modulus));
+	}
+	if (component.duckdb_base != SubstraitExtractComponent::NOT_INDEXED) {
+		// The `indexing` option says whether counting starts at 1 or 0; shift DuckDB's base to
+		// match. Substrait requires the option for these components, but default to ONE rather
+		// than rejecting plans that omit it.
+		int8_t requested_base = 1;
+		if (enum_expressions.size() > 1) {
+			if (StringUtil::CIEquals(enum_expressions[1], "ZERO")) {
+				requested_base = 0;
+			} else if (!StringUtil::CIEquals(enum_expressions[1], "ONE")) {
+				throw NotImplementedException("Unknown Substrait extract indexing option \"%s\"",
+				                              enum_expressions[1]);
+			}
+		}
+		int64_t delta = requested_base - component.duckdb_base;
+		if (delta != 0) {
+			result = WrapBinary("+", std::move(result), Value::BIGINT(delta));
+		}
+	}
+	return result;
 }
 
 unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformScalarFunctionExpr(const substrait::Expression &sexpr) {
@@ -604,11 +705,7 @@ unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformScalarFunctionExpr(cons
 		D_ASSERT(children.size() >= 1);
 		return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE, std::move(children));
 	} else if (function_name == "extract") {
-		D_ASSERT(enum_expressions.size() == 1);
-		auto &subfield = enum_expressions[0];
-		VerifyCorrectExtractSubfield(subfield);
-		auto constant_expression = make_uniq<ConstantExpression>(Value(subfield));
-		children.insert(children.begin(), std::move(constant_expression));
+		return TransformExtractExpr(enum_expressions, std::move(children));
 	}
 
 	return make_uniq<FunctionExpression>(RemapFunctionName(function_name), std::move(children));
